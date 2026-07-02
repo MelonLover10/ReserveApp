@@ -1,6 +1,6 @@
 {
   "expo": {
-    "scheme": "supply_app",
+    "scheme": "supplyapp",
     "name": "SupplyApp",
     "slug": "SupplyApp",
     "version": "1.0.0",
@@ -43,6 +43,6 @@
         "projectId": "c46e0414-c275-4a67-b33d-d7f765310129"
       }
     },
-    "owner": "chairw"
+    "owner": "melonlover10"
   }
 }
