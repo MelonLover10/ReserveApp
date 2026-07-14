@@ -26,7 +26,8 @@ export function ChatProvider({ children }) {
     try {
       const chatsQuery = query(
         collection(db, "chats"),
-        where("matchId", "==", matchId)
+        where("matchId", "==", matchId),
+        where("participants", "array-contains", userId)
       );
 
       const snapshot = await getDocs(chatsQuery);
@@ -35,9 +36,6 @@ export function ChatProvider({ children }) {
         const chatDoc = snapshot.docs[0];
         const existingData = chatDoc.data();
 
-        // If this user's email isn't in the map yet, write it.
-        // The security rule allows updating participantEmails in isolation,
-        // so we send only that field in the update.
         if (!existingData.participantEmails?.[userId]) {
           await updateDoc(doc(db, "chats", chatDoc.id), {
             [`participantEmails.${userId}`]: contactInfo.myEmail,
@@ -184,7 +182,8 @@ export function ChatProvider({ children }) {
     try {
       const chatsQuery = query(
         collection(db, "chats"),
-        where("matchId", "==", matchId)
+        where("matchId", "==", matchId),
+        where("participants", "array-contains", userId)
       );
 
       const snapshot = await getDocs(chatsQuery);

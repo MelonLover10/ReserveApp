@@ -33,12 +33,13 @@ Amazon Wishlists - Teachers can link their Amazon wishlists to accept direct don
 - Node.js v18+
 - npm v9+
 - Git
+- Expo Go App (on your phone)
 
 ### Installation
 
 1. **Clone the repo**
    ```bash
-   git clone https://github.com/claireschair/ReserveApp.git
+   git clone https://github.com/MelonLover10/ReserveApp.git
    cd ReserveApp
    ```
 

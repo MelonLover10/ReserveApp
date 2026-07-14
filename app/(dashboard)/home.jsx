@@ -229,7 +229,6 @@ const Home = () => {
         </View>
 
         <View style={styles.footer}>
-          <ThemedText style={styles.footerText}>About • Contact • Privacy</ThemedText>
           <ThemedText style={styles.footerSub}>© 2026 Reserve</ThemedText>
         </View>
       </ScrollView>

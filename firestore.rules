@@ -1,0 +1,354 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================================
+    // HELPER FUNCTIONS
+    // ============================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isParticipant(participants) {
+      return isSignedIn() && request.auth.uid in participants;
+    }
+
+    // Returns true if none of `keys` changed between old (resource) and new (request.resource)
+    function unchanged(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasAny(keys) == false;
+    }
+
+    function onlyChanged(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+
+    // ============================================================
+    // USERS  /users/{userId}
+    // ============================================================
+    match /users/{userId} {
+
+      // Any signed-in user can read profiles (needed for matching, school display, ratings)
+      allow read: if isSignedIn();
+
+      // Only the user can create their own profile document
+      allow create: if isOwner(userId) &&
+                       request.resource.data.uid == userId &&
+                       request.resource.data.keys().hasAll(
+                         ['uid', 'name', 'email', 'label', 'school',
+                          'pushToken', 'notificationsEnabled', 'createdAt']
+                       );
+
+      // Two distinct, mutually exclusive update paths:
+      allow update: if isSignedIn() && (
+
+        // (A) Owner editing their own profile — cannot touch identity/rating fields
+        (
+          isOwner(userId) &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          unchanged(['ratingAverage', 'ratingCount'])
+        )
+
+        ||
+
+        // (B) A reviewer updating ONLY the rating aggregate on someone else's profile.
+        // This is triggered by ReviewContext.submitReview()'s transaction.
+        // NOTE: Rules cannot verify "no duplicate review" here (that requires a query).
+        // The reviews collection's create rule does most of the real validation;
+        // this just bounds the blast radius to two numeric fields with sane values.
+        (
+          !isOwner(userId) &&
+          onlyChanged(['ratingAverage', 'ratingCount']) &&
+          request.resource.data.ratingAverage is number &&
+          request.resource.data.ratingAverage >= 0 &&
+          request.resource.data.ratingAverage <= 5 &&
+          request.resource.data.ratingCount is int &&
+          request.resource.data.ratingCount == resource.data.get('ratingCount', 0) + 1
+        )
+      );
+
+      // deleteAccount() calls deleteDoc() directly on this path, so owner delete
+      // must stay allowed or account deletion breaks.
+      allow delete: if isOwner(userId);
+
+
+      // ----------------------------------------
+      // WISHLISTS  /users/{userId}/wishlists/{wishlistId}
+      // ----------------------------------------
+      match /wishlists/{wishlistId} {
+
+        // Public read — teachers share Amazon links with donors
+        allow read: if isSignedIn();
+
+        allow create: if isOwner(userId) &&
+                         request.resource.data.userId == userId &&
+                         request.resource.data.keys().hasAll(
+                           ['userId', 'name', 'amazonLink', 'items', 'createdAt', 'updatedAt']
+                         ) &&
+                         request.resource.data.amazonLink is string &&
+                         request.resource.data.amazonLink.size() > 0 &&
+                         request.resource.data.amazonLink.matches('.*amazon\\.[a-z.]+.*') &&
+                         request.resource.data.items is list;
+
+        allow update: if isOwner(userId) &&
+                         request.resource.data.userId == resource.data.userId &&
+                         request.resource.data.createdAt == resource.data.createdAt &&
+                         request.resource.data.amazonLink is string &&
+                         request.resource.data.amazonLink.size() > 0 &&
+                         request.resource.data.amazonLink.matches('.*amazon\\.[a-z.]+.*');
+
+        allow delete: if isOwner(userId);
+      }
+    }
+
+
+    // ============================================================
+    // REQUESTS (donations + receive requests)  /requests/{requestId}
+    // ============================================================
+    match /requests/{requestId} {
+
+      // Broad read — required for the matching algorithm to scan all active requests
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+                       request.resource.data.keys().hasAll(
+                         ['userId', 'type', 'items', 'quantities', 'specs',
+                          'location', 'status', 'createdAt', 'expiresAt', 'match']
+                       ) &&
+                       request.resource.data.type in ['donate', 'receive'] &&
+                       request.resource.data.status == 'active' &&
+                       request.resource.data.items is list &&
+                       request.resource.data.items.size() > 0 &&
+                       request.resource.data.items.size() == request.resource.data.quantities.size() &&
+                       request.resource.data.items.size() == request.resource.data.specs.size() &&
+                       (
+                         // Normal case: you're creating your own request
+                         request.resource.data.userId == request.auth.uid
+
+                         ||
+
+                         // Auto-resubmit case: MatchContext.resubmitLeftoverItems() /
+                         // resubmitAllItems() create a request on behalf of your match
+                         // PARTNER after you complete a match or report them.
+                         // This is a known trust-boundary gap — see FIRESTORE-RULES-GUIDE
+                         // for why it can't be fully closed without a Cloud Function, and
+                         // how to close it if you want to before launch.
+                         (
+                           request.resource.data.isAutoResubmit == true &&
+                           request.resource.data.userId != request.auth.uid
+                         )
+                       );
+
+      // Update covers: selecting/cancelling/approving matches, completing matches,
+      // reporting. Both the owner and the current match partner may need to write,
+      // because completing/selecting a match touches both sides' documents.
+      allow update: if isSignedIn() &&
+                       (
+                         request.auth.uid == resource.data.userId ||
+                         (resource.data.match.partnerUserId != null &&
+                          request.auth.uid == resource.data.match.partnerUserId) ||
+                         (request.resource.data.match.partnerUserId != null &&
+                          request.auth.uid == request.resource.data.match.partnerUserId)
+                       ) &&
+                       // Item contents are immutable after creation — only status/match/
+                       // completion metadata can change via update.
+                       request.resource.data.userId == resource.data.userId &&
+                       request.resource.data.items == resource.data.items &&
+                       request.resource.data.quantities == resource.data.quantities &&
+                       request.resource.data.specs == resource.data.specs;
+
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+
+    // ============================================================
+    // CHATS  /chats/{chatId}
+    // ============================================================
+    match /chats/{chatId} {
+
+      allow read: if isParticipant(resource.data.participants);
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid in request.resource.data.participants &&
+                       request.resource.data.participants.size() == 2 &&
+                       request.resource.data.keys().hasAll(
+                         ['participants', 'participantEmails', 'matchId', 'createdAt',
+                          'status', 'lastMessage', 'lastMessageTimestamp']
+                       ) &&
+                       request.resource.data.status == 'active';
+
+      // Participants can update chat metadata (messages, status, completion),
+      // but cannot change who the participants are.
+      allow update: if isParticipant(resource.data.participants) &&
+                       request.resource.data.participants == resource.data.participants;
+
+      allow delete: if false;
+
+
+      // ----------------------------------------
+      // MESSAGES  /chats/{chatId}/messages/{messageId}
+      // ----------------------------------------
+      match /messages/{messageId} {
+
+        allow read: if isSignedIn() &&
+                       request.auth.uid in
+                         get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid in
+                           get(/databases/$(database)/documents/chats/$(chatId)).data.participants &&
+                         request.resource.data.senderId == request.auth.uid &&
+                         request.resource.data.keys().hasAll(['senderId', 'text', 'timestamp']) &&
+                         request.resource.data.text is string &&
+                         request.resource.data.text.size() > 0 &&
+                         request.resource.data.text.size() <= 5000;
+
+        // Only the "read" flag may change post-send — text/sender are immutable
+        allow update: if isSignedIn() &&
+                         request.auth.uid in
+                           get(/databases/$(database)/documents/chats/$(chatId)).data.participants &&
+                         onlyChanged(['read']);
+
+        allow delete: if false;
+      }
+    }
+
+
+    // ============================================================
+    // REPORTS  /reports/{reportId}
+    // ============================================================
+    match /reports/{reportId} {
+
+      // Reporters can only ever read their own submitted reports
+      // (matches getMyReports()/hasReported() query patterns).
+      // Full moderator access requires a custom admin claim — not implemented yet.
+      allow read: if isSignedIn() && resource.data.reporterId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       request.resource.data.reporterId == request.auth.uid &&
+                       request.resource.data.reportedUserId != request.auth.uid &&
+                       request.resource.data.keys().hasAll(
+                         ['reporterId', 'reportedUserId', 'reason', 'description',
+                          'context', 'status', 'createdAt', 'resolvedAt',
+                          'resolvedBy', 'moderatorNotes']
+                       ) &&
+                       request.resource.data.status == 'pending' &&
+                       request.resource.data.reason in
+                         ['inappropriate_language', 'harassment', 'spam', 'no_show',
+                          'unsafe_behavior', 'fake_items', 'other'] &&
+                       request.resource.data.description is string &&
+                       request.resource.data.description.size() <= 2000;
+
+      allow update: if false; // moderation happens server-side / console only
+      allow delete: if false;
+    }
+
+
+    // ============================================================
+    // REVIEWS  /reviews/{reviewId}
+    // ============================================================
+    match /reviews/{reviewId} {
+
+      // Public — ratings/comments are a credibility signal shown on profiles
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+                       request.resource.data.reviewerId == request.auth.uid &&
+                       request.resource.data.keys().hasAll(
+                         ['reviewerId', 'revieweeId', 'matchId', 'rating', 'comment', 'createdAt']
+                       ) &&
+                       request.resource.data.reviewerId != request.resource.data.revieweeId &&
+                       request.resource.data.rating is int &&
+                       request.resource.data.rating >= 1 &&
+                       request.resource.data.rating <= 5 &&
+                       request.resource.data.comment is string &&
+                       request.resource.data.comment.size() <= 300 &&
+                       // The match must exist, be completed, and the reviewer must have
+                       // actually been one of its two participants.
+                       get(/databases/$(database)/documents/requests/$(request.resource.data.matchId)).data.status == 'completed' &&
+                       (
+                         get(/databases/$(database)/documents/requests/$(request.resource.data.matchId)).data.userId == request.auth.uid ||
+                         get(/databases/$(database)/documents/requests/$(request.resource.data.matchId)).data.match.partnerUserId == request.auth.uid
+                       );
+                       // NOTE: "one review per match per reviewer" is enforced client-side
+                       // via a query in ReviewContext, not by these rules (rules can't run
+                       // queries). See FIRESTORE-RULES-GUIDE for a deterministic-doc-ID
+                       // pattern that would let rules enforce this too.
+
+      allow update: if false;
+      allow delete: if false;
+    }
+
+
+    // ============================================================
+    // FEEDBACK  /feedback/{feedbackId}
+    // ============================================================
+    match /feedback/{feedbackId} {
+
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       request.resource.data.userId == request.auth.uid &&
+                       request.resource.data.keys().hasAll(['userId', 'rating', 'text', 'createdAt']) &&
+                       request.resource.data.rating is int &&
+                       request.resource.data.rating >= 1 &&
+                       request.resource.data.rating <= 5 &&
+                       request.resource.data.text is string &&
+                       request.resource.data.text.size() <= 2000;
+
+      allow update: if false;
+      allow delete: if false;
+    }
+
+
+    // ============================================================
+    // CENTERS (drop-off centers)  /centers/{centerId}
+    // ============================================================
+    match /centers/{centerId} {
+
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+                       request.resource.data.createdBy == request.auth.uid &&
+                       request.resource.data.keys().hasAll(
+                         ['name', 'location', 'items', 'createdAt', 'createdBy', 'verified']
+                       ) &&
+                       request.resource.data.verified == false &&
+                       request.resource.data.name is string &&
+                       request.resource.data.name.size() > 0 &&
+                       (
+                         request.resource.data.get('startDate', null) == null ||
+                         request.resource.data.get('endDate', null) == null ||
+                         request.resource.data.get('startDate', null) <= request.resource.data.get('endDate', null)
+                       );
+
+      // Creator can edit their own center, but never after it's been verified,
+      // and never the verified flag itself (that's an admin-only action —
+      // toggle it via the Firebase console or a future admin Cloud Function).
+      allow update: if isSignedIn() &&
+                       isOwner(resource.data.createdBy) &&
+                       resource.data.verified == false &&
+                       request.resource.data.createdBy == resource.data.createdBy &&
+                       request.resource.data.createdAt == resource.data.createdAt &&
+                       request.resource.data.verified == resource.data.verified;
+
+      allow delete: if isSignedIn() &&
+                       isOwner(resource.data.createdBy) &&
+                       resource.data.verified == false;
+    }
+
+
+    // ============================================================
+    // DEFAULT DENY — everything else is blocked
+    // ============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
