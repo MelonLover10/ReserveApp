@@ -57,7 +57,7 @@ const VerifyEmail = () => {
         <Spacer height={10} />
 
         <ThemedText style={styles.instruction}>
-          Click the link in your email to verify your account, then come back and log in.
+          Click the link in your email to verify your account, then come back and log in. Look for an email from reserve-11b9d. Make sure to check your spam inbox as well.
         </ThemedText>
 
         <Spacer height={30} />
